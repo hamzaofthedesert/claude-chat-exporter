@@ -4,20 +4,25 @@ function setupClaudeExporter() {
   const humanMessages = [];
   let interceptorActive = true;
 
-  // DOM Selectors - easily modifiable if Claude's UI changes
+  // DOM Selectors
   const SELECTORS = {
     userMessage: '[data-testid="user-message"]',
     messageGroup: '.group',
     copyButton: 'button[data-testid="action-bar-copy"]',
     editButton: 'button[aria-label="Edit"]',
     editTextarea: 'textarea',
-    conversationTitle: '[data-testid="chat-title-button"] .truncate, button[data-testid="chat-title-button"] div.truncate'
+    conversationTitle: '[data-testid="chat-title-button"] .truncate, button[data-testid="chat-title-button"] div.truncate',
+    
+    // Pasted document selectors - use attribute selector for complex class names
+    pastedDocPreview: 'p[class*="line-clamp"], p[class*="text-text-500"]',
+    expandedDocContent: 'div[class*="overflow-y-auto"][class*="font-mono"]'
   };
 
   const DELAYS = {
-    hover: 50,    // Time to wait for hover effects
-    edit: 150,    // Time for edit interface to load
-    copy: 100     // Time between copy operations
+    hover: 50,
+    edit: 150,
+    copy: 100,
+    expand: 400  // For pasted doc expansion
   };
 
   function downloadMarkdown(content, filename) {
@@ -43,51 +48,174 @@ function setupClaudeExporter() {
       return 'claude_conversation';
     }
 
-    // Sanitize filename: remove/replace invalid characters
     return title
-      .replace(/[<>:"/\\|?*]/g, '_')  // Replace invalid filename chars
-      .replace(/\s+/g, '_')           // Replace spaces with underscores
-      .replace(/_{2,}/g, '_')         // Replace multiple underscores with single
-      .replace(/^_+|_+$/g, '')        // Trim leading/trailing underscores
+      .replace(/[<>:"/\\|?*]/g, '_')
+      .replace(/\s+/g, '_')
+      .replace(/_{2,}/g, '_')
+      .replace(/^_+|_+$/g, '')
       .toLowerCase()
-      .substring(0, 100);             // Limit length
+      .substring(0, 100);
+  }
+
+  async function extractPastedDocuments(messageContainer) {
+    const documents = [];
+    
+    try {
+      console.log('🔍 Starting pasted document extraction...');
+      
+      // Strategy 1: Search within the same message group
+      const messageGroup = messageContainer.closest(SELECTORS.messageGroup);
+      
+      if (!messageGroup) {
+        console.warn('⚠️ User message not found within a message group');
+        return documents;
+      }
+      
+      console.log('📦 Message group found:', messageGroup.className);
+      
+      let preview = messageGroup.querySelector(SELECTORS.pastedDocPreview);
+      
+      // Strategy 2: Check sibling groups
+      if (!preview) {
+        console.log('🔍 Not in same group, checking ALL nearby groups...');
+        
+        // Go to parent and search ALL descendants
+        const parentContainer = messageGroup.parentElement;
+        if (parentContainer) {
+          // Search for ANY p element with line-clamp
+          const allPreviews = parentContainer.querySelectorAll('p[class*="line-clamp"]');
+          console.log(`Found ${allPreviews.length} potential pasted doc previews`);
+          
+          if (allPreviews.length > 0) {
+            // Take the first one (or most recent)
+            preview = allPreviews[0];
+            console.log('✅ Using first found preview');
+          }
+        }
+      }
+      
+      // Strategy 3: Nuclear option - search entire document
+      if (!preview) {
+        console.log('🔍 Last resort: searching entire document...');
+        const allPreviews = document.querySelectorAll('p[class*="line-clamp"]');
+        console.log(`Found ${allPreviews.length} previews in entire document`);
+        
+        if (allPreviews.length > 0) {
+          preview = allPreviews[0];
+          console.log('⚠️ Using first preview from document-wide search');
+        }
+      }
+      
+      if (!preview) {
+        console.log('ℹ️ No pasted document preview found anywhere');
+        return documents;
+      }
+      
+      console.log('📄 Found pasted document preview, expanding...');
+      console.log('Preview classes:', preview.className);
+      console.log('Preview text:', preview.textContent.substring(0, 100));
+      
+      // Click to expand
+      preview.click();
+      await delay(DELAYS.expand);
+      
+      // Find expanded content - try multiple selectors
+      const selectors = [
+        'div[class*="overflow-y-auto"][class*="font-mono"]',
+        'div[class*="whitespace-pre-wrap"][class*="overflow-y-auto"]',
+        '.bg-bg-000.rounded-lg.overflow-y-auto',
+        // Also try without font-mono requirement
+        'div[class*="overflow-y-auto"][class*="bg-bg-000"]'
+      ];
+      
+      for (const selector of selectors) {
+        const elements = document.querySelectorAll(selector);
+        console.log(`🔎 Trying selector "${selector}": found ${elements.length} elements`);
+        
+        for (const el of elements) {
+          const text = el.textContent?.trim();
+          if (text && text.length > 500) {
+            console.log(`✅ Extracted pasted document (${text.length} chars)`);
+            documents.push(text);
+            
+            // Close the expanded view
+            preview.click();
+            await delay(DELAYS.hover);
+            
+            return documents;
+          }
+        }
+      }
+      
+      console.warn('⚠️ Pasted document preview found but could not extract expanded content');
+      console.log('Tried all selectors but found no large text blocks');
+      
+    } catch (error) {
+      console.error('❌ Failed to extract pasted document:', error);
+    }
+    
+    return documents;
   }
 
   async function extractMessageContent(messageContainer, messageIndex) {
     try {
-      // Trigger hover to reveal edit button
+      let fullContent = '';
+      
+      console.log(`\n--- Extracting message ${messageIndex + 1} ---`);
+      
+      // STEP 1: Extract pasted documents FIRST (before edit mode)
+      const pastedDocs = await extractPastedDocuments(messageContainer);
+      console.log(`Found ${pastedDocs.length} pasted documents`);
+      
+      // STEP 2: Extract textarea content via edit mode
       messageContainer.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
       await delay(DELAYS.hover);
 
       const messageGroup = messageContainer.closest(SELECTORS.messageGroup);
-      const editButton = messageGroup.querySelector(SELECTORS.editButton);
+      const editButton = messageGroup?.querySelector(SELECTORS.editButton);
 
       if (editButton) {
-        console.log(`📝 Extracting message ${messageIndex + 1} via edit`);
+        console.log(`📝 Clicking edit button for message ${messageIndex + 1}`);
         editButton.click();
         await delay(DELAYS.edit);
 
-        // Get content from edit interface
         const editTextarea = document.querySelector(SELECTORS.editTextarea);
 
-        let content = '';
         if (editTextarea) {
-          content = editTextarea.value;
+          fullContent = editTextarea.value;
+          console.log(`✅ Got textarea content: ${fullContent.length} chars`);
+        } else {
+          console.warn('⚠️ Edit textarea not found');
         }
 
         // Close edit mode
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
         await delay(DELAYS.hover);
-
-        if (content) return content;
+      } else {
+        console.warn('⚠️ Edit button not found');
       }
 
-      throw new Error(`Edit button not found`);
+      // STEP 3: Combine textarea + pasted documents
+      if (pastedDocs.length > 0) {
+        const docsText = pastedDocs.map((doc, i) => 
+          `\n\n---\n\n**[Pasted Document ${i + 1}]**\n\n${doc}`
+        ).join('');
+        
+        fullContent = fullContent ? fullContent + docsText : docsText;
+        console.log(`✅ Combined content: ${fullContent.length} chars total`);
+      }
+
+      if (fullContent) {
+        console.log(`✅ Successfully extracted message ${messageIndex + 1}`);
+        return fullContent;
+      }
+
+      throw new Error(`Could not extract content (no textarea and no pasted docs)`);
 
     } catch (error) {
-      console.error(`Failed to extract message ${messageIndex + 1}:`, error);
+      console.error(`❌ Failed to extract message ${messageIndex + 1}:`, error);
+      return null;
     } finally {
-      // Clean up hover state
       messageContainer.dispatchEvent(new MouseEvent('mouseleave', { bubbles: true }));
     }
   }
@@ -148,7 +276,6 @@ function setupClaudeExporter() {
 
     console.log(`🚀 Clicking ${copyButtons.length} Claude copy buttons...`);
 
-    // Click all copy buttons with minimal delays
     for (let i = 0; i < copyButtons.length; i++) {
       const button = copyButtons[i];
       try {
@@ -161,7 +288,6 @@ function setupClaudeExporter() {
         console.warn(`Failed to click button ${i + 1}:`, error);
       }
 
-      // Only delay between clicks, not after the last one
       if (i < copyButtons.length - 1) {
         await delay(DELAYS.copy);
       }
@@ -169,15 +295,20 @@ function setupClaudeExporter() {
   }
 
   function buildMarkdown() {
-    let markdown = "# Conversation with Claude\n\n";
+    let markdown = "# Conversation Export\n\n";
+    
+    // Interleave messages in chronological order
     const maxLength = Math.max(humanMessages.length, capturedResponses.length);
 
     for (let i = 0; i < maxLength; i++) {
+      // Add human message if it exists
       if (i < humanMessages.length && humanMessages[i].content) {
-        markdown += `## Human:\n\n${humanMessages[i].content}\n\n---\n\n`;
+        markdown += `${humanMessages[i].content}\n\n---gmpu.end---\n\n`;
       }
+      
+      // Add Claude response if it exists
       if (i < capturedResponses.length) {
-        markdown += `## Claude:\n\n${capturedResponses[i].content}\n\n---\n\n`;
+        markdown += `${capturedResponses[i].content}\n\n---gmpu.end---\n\n`;
       }
     }
 
@@ -185,8 +316,8 @@ function setupClaudeExporter() {
   }
 
   async function waitForClipboardOperations(expectedCount) {
-    const maxWaitTime = 2000; // Maximum wait time
-    const checkInterval = 100; // Check every 100ms
+    const maxWaitTime = 2000;
+    const checkInterval = 100;
     let elapsed = 0;
 
     while (elapsed < maxWaitTime) {
@@ -209,7 +340,6 @@ function setupClaudeExporter() {
       statusDiv.textContent = 'Copying Claude responses...';
       await triggerClaudeResponseCopy();
 
-      // Smart wait - only as long as needed
       const copyButtons = document.querySelectorAll(SELECTORS.copyButton);
       await waitForClipboardOperations(copyButtons.length);
 
